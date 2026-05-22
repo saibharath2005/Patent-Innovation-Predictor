@@ -377,3 +377,12 @@ Task 4 (Innovation Forecaster)
 All tasks run **sequentially** — each agent receives the previous agent's output as context.
 
 ---
+
+ 
+## ◈ License
+ 
+```
+MIT License — See `LICENSE` for full terms.
+```
+ 
+---
