@@ -378,11 +378,7 @@ All tasks run **sequentially** — each agent receives the previous agent's outp
 
 ---
 
- 
+
 ## ◈ License
  
-```
-MIT License — See `LICENSE` for full terms.
-```
- 
----
+MIT License — see `LICENSE` for details.
