@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual Environment
+venv/
+env/
+ProductAgent/
+
+# Environment Variables
+.env
+
+# IDE Files
+.vscode/
+.idea/
+
+.results
