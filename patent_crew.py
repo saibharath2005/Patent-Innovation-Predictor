@@ -154,13 +154,13 @@ class AnalyzePatentTrendsToolSchema(BaseModel):
 # Tools
 # ---------------------------------------------------------------------------
 
-# FIX 1: Truncate tool output to avoid overwhelming small LLMs.
+# Truncate tool output to avoid overwhelming small LLMs.
 # llama3 has a ~4k-8k context window. Returning 30 full abstracts at 200 chars
 # each plus titles/dates easily exceeds what the model can reliably process
 # and still produce a well-formed "Final Answer". We cap each abstract at 120
 # chars and limit total output to MAX_TOOL_OUTPUT_CHARS characters.
-MAX_TOOL_OUTPUT_CHARS = 3000
-ABSTRACT_PREVIEW_CHARS = 120
+MAX_TOOL_OUTPUT_CHARS = 1800
+ABSTRACT_PREVIEW_CHARS = 80
 
 
 def _format_patent_results(results: list) -> str:
@@ -292,7 +292,6 @@ class AnalyzePatentTrendsTool(BaseTool):
 
         lines = patents_data.strip().splitlines()
         count = sum(1 for line in lines if line.strip().startswith(tuple("0123456789")))
-        # FIX 2: Return a shorter analysis snippet so the LLM can reason over it
         preview = patents_data[:800] + ("..." if len(patents_data) > 800 else "")
         return (
             f"Trend analysis over {count} patent entries:\n"
@@ -331,18 +330,30 @@ def create_patent_analysis_crew(model_name: str = "llama3:latest") -> Crew:
 
     print(f"✅ Model '{model_name}' found and tested successfully.")
 
-    # FIX 3: Lower num_ctx to a safe value for llama3 (4096 tokens).
-    # The default of 2048 is sometimes too small for tool-use chains; 4096
-    # gives more headroom without hitting OOM on most hardware.
+    # FIX: Use the "ollama_chat/" provider prefix instead of "ollama/".
+    # litellm's "ollama/" path routes through the legacy /api/generate
+    # endpoint and the ollama_pt() prompt formatter, which has a known bug
+    # (IndexError: list index out of range in factory.py) when handling
+    # certain message sequences during CrewAI's simulated tool-calling flow.
+    # "ollama_chat/" routes through /api/chat and a different, more robust
+    # litellm formatter that avoids this code path entirely.
+    #
+    # FIX (num_ctx): Ollama silently defaults to a 2048-token context window
+    # for ANY model unless num_ctx is explicitly passed, regardless of what
+    # the model actually supports. The ReAct system prompt + full tool list
+    # + task description + tool Observation text routinely exceeds 2048
+    # tokens in this crew, which causes Ollama to return a truncated/empty
+    # completion instead of a clean error — this is exactly what produces
+    # "Received None or empty response from LLM call." CrewAI's LLM class
+    # forwards unrecognized kwargs straight through to litellm -> Ollama's
+    # /api/chat options, so num_ctx below actually takes effect.
     llm = LLM(
-        model=f"ollama/{model_name}",
-        api_base="http://localhost:11434",
-        temperature=0.2,
-        stream=False,
-        extra_headers={},          # avoid accidental header injection
-        # Pass Ollama-specific options via the num_ctx key recognised by
-        # LiteLLM (CrewAI's underlying router).
-        additional_params={"options": {"num_ctx": 4096}},
+        model=f"ollama_chat/{model_name}",
+        base_url="http://localhost:11434",
+        temperature=0.3,
+        num_ctx=8192,
+        num_predict=1024,
+        request_timeout=180,
     )
 
     tools = [
@@ -357,7 +368,6 @@ def create_patent_analysis_crew(model_name: str = "llama3:latest") -> Crew:
     def _clean_step_output(step_output):
         if hasattr(step_output, "output"):
             if step_output.output is None:
-                # FIX 4: Prevent NoneType propagation that causes "LLM Failed"
                 step_output.output = "Step produced no output. Continuing."
             elif isinstance(step_output.output, str):
                 step_output.output = strip_think_tags(step_output.output)
@@ -365,14 +375,9 @@ def create_patent_analysis_crew(model_name: str = "llama3:latest") -> Crew:
 
     # ------------------------------------------------------------------
     # Agents
-    # FIX 5: Add explicit ReAct-format system prompt snippet so llama3
-    # knows it MUST emit "Final Answer:" after using a tool.
     # ------------------------------------------------------------------
     REACT_REMINDER = (
-        "\n\nIMPORTANT: After you receive a tool result you MUST write:\n"
-        "Thought: I now know the answer.\n"
-        "Final Answer: <your complete answer here>\n"
-        "Never leave a turn without a Final Answer."
+        "\n\nAfter a tool result, always write a Final Answer. Never stop mid-turn."
     )
 
     research_director = Agent(
@@ -402,8 +407,6 @@ def create_patent_analysis_crew(model_name: str = "llama3:latest") -> Crew:
         llm=llm,
         tools=tools,
         memory=False,
-        # FIX 6: Increase max_iter so the agent gets more chances to emit
-        # a Final Answer after a tool call before CrewAI marks it Failed.
         max_iter=8,
         max_retry_limit=5,
     )
@@ -442,8 +445,6 @@ def create_patent_analysis_crew(model_name: str = "llama3:latest") -> Crew:
 
     # ------------------------------------------------------------------
     # Tasks
-    # FIX 7: Each task description now ends with an explicit instruction
-    # to write "Final Answer:" so llama3 knows when to stop iterating.
     # ------------------------------------------------------------------
     task1 = Task(
         description=(
@@ -464,13 +465,19 @@ def create_patent_analysis_crew(model_name: str = "llama3:latest") -> Crew:
     _end_date = datetime.now().strftime("%Y-%m-%d")
     _start_date = (datetime.now() - timedelta(days=3 * 365)).strftime("%Y-%m-%d")
 
+    # FIX: All literal JSON braces in the Action Input example are escaped
+    # as {{ }} so CrewAI's later .format(research_area=..., **inputs) call
+    # does not misinterpret them as format-field delimiters. The real
+    # {research_area} placeholder (single braces) is left alone so it gets
+    # substituted with the actual value passed at kickoff() time.
     task2 = Task(
         description=(
             "Retrieve patents about {research_area} published in the last 3 years.\n\n"
             "Step 1 — Call the tool ONCE using this exact format:\n"
             "  Action: search_patents_by_date_range\n"
-            f'  Action Input: {{"query": "{"{research_area}".lower()}", '
-            f'"start_date": "{_start_date}", "end_date": "{_end_date}", "top_k": 10}}\n\n'
+            "  Action Input: {{\"query\": \"{research_area}\", "
+            f"\"start_date\": \"{_start_date}\", \"end_date\": \"{_end_date}\", "
+            "\"top_k\": 10}}\n\n"
             "Step 2 — After you receive the Observation, immediately write:\n"
             "  Thought: I now have the patent list.\n"
             "  Final Answer: [summarise total patents found, list titles, "
@@ -574,7 +581,9 @@ def run_patent_analysis(
             "2. Pull a compatible model:      ollama pull llama3\n"
             "3. For deepseek-r1 models use at least the 7b variant for tool use.\n"
             "4. Check Ollama logs for errors: journalctl -u ollama  (Linux)\n"
-            "5. Try a larger/more capable model if llama3 fails on tool calls.\n"
+            "5. Upgrade litellm if you see 'list index out of range' errors:\n"
+            "   pip install -U litellm\n"
+            "6. Try a larger/more capable model if llama3 fails on tool calls.\n"
             "   Recommended: ollama pull llama3.1  or  ollama pull mistral"
         )
 
